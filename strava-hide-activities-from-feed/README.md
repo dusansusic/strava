@@ -1,6 +1,6 @@
 # Strava Hide Activities From Feed
 
-A Docker-based utility that automatically hides your Strava activities from your home feed.
+A Docker-based utility that automatically hides your Strava activities from your home feed. I hope this will be added by Strava soon, under Privacy controls.
 
 ## Overview
 
