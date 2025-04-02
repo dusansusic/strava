@@ -1,0 +1,13 @@
+services:
+  strava-auto-hide:
+    volumes:
+      - ./src:/app/src
+      - ${TOKEN_PATH:-./tokens}:/app/tokens  # Mount tokens directory
+    environment:
+      - CLIENT_ID=
+      - CLIENT_SECRET=
+      - REDIRECT_URI=http://localhost:8000/callback
+      - TOKEN_FILE=/app/tokens/.strava_token.json  # Configure token path
+      - ACTIVITY_LOOKBACK_MINUTES=300
+    image: dusansusic/strava-hide-activities:latest
+    # Removed restart directive

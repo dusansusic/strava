@@ -1,36 +1,52 @@
 #!/usr/bin/env python3
-# checks if acitivy if uploaded in the last 60 minutes and hide it from home feed
 
 import requests
 import os
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from urllib.parse import urlencode
+import sys
 
 # Configuration
-CLIENT_ID = "12345"
-CLIENT_SECRET = "123454321234543214543212"
+CLIENT_ID = os.environ.get('CLIENT_ID', '')
+CLIENT_SECRET = os.environ.get('CLIENT_SECRET', '')
 TOKEN_URL = "https://www.strava.com/oauth/token"
 AUTH_URL = "https://www.strava.com/oauth/authorize"
 API_BASE = "https://www.strava.com/api/v3"
-REDIRECT_URI = "http://localhost:8000/callback"
+REDIRECT_URI = os.environ.get('REDIRECT_URI', "http://localhost:8000/callback")
+ACTIVITY_LOOKBACK_MINUTES = int(os.environ.get('ACTIVITY_LOOKBACK_MINUTES', 300))  # Timeframe to check for recent activities
 
 # Setup logging
-LOG_FILE = Path.home() / "strava_exclude_job.log"
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 # Token storage
-TOKEN_FILE = Path.home() / ".strava_token.json"
+TOKEN_FILE = Path(os.environ.get('TOKEN_FILE', Path.home() / ".strava_token.json"))
+
+# Validate required environment variables
+def validate_credentials():
+    if not CLIENT_ID:
+        error_msg = "ERROR: CLIENT_ID environment variable is not set"
+        logging.error(error_msg)
+        print(error_msg)
+        sys.exit(1)
+    
+    if not CLIENT_SECRET:
+        error_msg = "ERROR: CLIENT_SECRET environment variable is not set"
+        logging.error(error_msg)
+        print(error_msg)
+        sys.exit(1)
+    
+    logging.info("Credentials validated successfully")
 
 # Global variable to store the authorization code
 auth_code = None
@@ -153,11 +169,23 @@ def refresh_token(refresh_token):
     return token_data.get('access_token')
 
 def update_activity(activity_id, access_token):
-    """Update activity to exclude it from home feed"""
+    """Update activity to exclude it from home feed if not already excluded"""
     url = f"{API_BASE}/activities/{activity_id}"
     headers = {'Authorization': f"Bearer {access_token}"}
-    data = {'hide_from_home': True}
     
+    # Fetch activity details to check if it's already excluded
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        logging.error(f"Failed to fetch activity {activity_id}: {response.text}")
+        return False
+    
+    activity_details = response.json()
+    if activity_details.get('hide_from_home', False):
+        logging.info(f"Activity {activity_id} is already excluded from home feed")
+        return True
+    
+    # Update activity to exclude it from home feed
+    data = {'hide_from_home': True}
     response = requests.put(url, headers=headers, json=data)
     if response.status_code != 200:
         logging.error(f"Failed to update activity {activity_id}: {response.text}")
@@ -166,13 +194,13 @@ def update_activity(activity_id, access_token):
     logging.info(f"Successfully updated activity {activity_id}")
     return True
 
-def get_recent_activities(access_token, minutes=60):
-    """Get activities created in the last X minutes (default: 60 minutes/1 hour)"""
+def get_recent_activities(access_token, minutes=ACTIVITY_LOOKBACK_MINUTES):
+    """Get the most recent 10 activities created in the last X minutes (default: 300 minutes/5 hours)"""
     url = f"{API_BASE}/athlete/activities"
     headers = {'Authorization': f"Bearer {access_token}"}
     
-    # Get more activities to ensure we don't miss any
-    params = {'per_page': 30}
+    # Fetch the last 10 activities
+    params = {'per_page': 10, 'page': 1}
     
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
@@ -181,40 +209,83 @@ def get_recent_activities(access_token, minutes=60):
     
     activities = response.json()
     
-    # Calculate the cutoff time
-    cutoff_time = datetime.now() - timedelta(minutes=minutes)
+    # Calculate the cutoff time in UTC using timezone.utc
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    
+    # Add debug logging
+    logging.info(f"Current UTC time: {datetime.now(timezone.utc)}, Cutoff time: {cutoff_time}")
     
     # Filter activities created in the last X minutes
-    recent_activities = []
-    for activity in activities:
-        activity_time = datetime.strptime(activity['start_date'], "%Y-%m-%dT%H:%M:%SZ")
-        if activity_time >= cutoff_time:
-            recent_activities.append(activity)
+    recent_activities = [
+        activity for activity in activities
+        if datetime.strptime(activity['start_date'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) >= cutoff_time
+    ]
     
+    logging.info(f"Found {len(recent_activities)} activities within the last {minutes} minutes")
     return recent_activities
 
 def main():
     try:
-        logging.info("Starting Strava auto-exclude job")
-        
-        # Get valid access token
+        logging.info("Starting Strava hide from home feed job")
+
+        validate_credentials()
+
         access_token = get_access_token()
         
-        # Get recent activities from the past hour
-        recent_activities = get_recent_activities(access_token, minutes=60)
+        # Get recent activities using the ACTIVITY_LOOKBACK_MINUTES value
+        recent_activities = get_recent_activities(access_token, minutes=ACTIVITY_LOOKBACK_MINUTES)
         
         if not recent_activities:
             logging.info("No recent activities found to process")
             return
         
+        # Track statistics
+        already_excluded = []
+        newly_excluded = []
+        
         # Process each recent activity
         for activity in recent_activities:
-            logging.info(f"Processing activity: {activity['name']} (ID: {activity['id']})")
-            success = update_activity(activity['id'], access_token)
+            activity_id = activity['id']
+            activity_name = activity['name']
+            logging.info(f"Processing activity: {activity_name} (ID: {activity_id})")
+            
+            # Get current status first
+            url = f"{API_BASE}/activities/{activity_id}"
+            headers = {'Authorization': f"Bearer {access_token}"}
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code != 200:
+                logging.error(f"Failed to fetch activity {activity_id}: {response.text}")
+                continue
+                
+            activity_details = response.json()
+            
+            if activity_details.get('hide_from_home', False):
+                logging.info(f"Activity '{activity_name}' (ID: {activity_id}) is already excluded from home feed")
+                already_excluded.append({"id": activity_id, "name": activity_name})
+                continue
+            
+            # Update the activity if not already excluded
+            success = update_activity(activity_id, access_token)
             if success:
-                logging.info(f"Activity '{activity['name']}' excluded from home feed")
+                logging.info(f"Activity '{activity_name}' (ID: {activity_id}) newly excluded from home feed")
+                newly_excluded.append({"id": activity_id, "name": activity_name})
         
-        logging.info(f"Job completed, processed {len(recent_activities)} activities")
+        # Summary stats
+        logging.info(f"Job completed. Found {len(recent_activities)} recent activities:")
+        
+        if already_excluded:
+            logging.info(f"Activities already excluded ({len(already_excluded)}):")
+            for activity in already_excluded:
+                logging.info(f"  - ID: {activity['id']}, Name: {activity['name']}")
+        
+        if newly_excluded:
+            logging.info(f"Activities newly excluded ({len(newly_excluded)}):")
+            for activity in newly_excluded:
+                logging.info(f"  - ID: {activity['id']}, Name: {activity['name']}")
+        
+        if not already_excluded and not newly_excluded:
+            logging.info("No activities were excluded")
         
     except Exception as e:
         logging.error(f"Error in job: {e}")
